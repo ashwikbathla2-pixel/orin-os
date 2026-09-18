@@ -93,6 +93,14 @@ pub fn kernel_main(multiboot_info_phys: u64, boot_params_phys: u64) -> ! {
     // with the reason on the serial port, which is the one thing that already
     // works at this point.
     if boot_params_phys == 0 {
+        // Cannot call set_serial_ok yet (it lives in .bss). Poke the UART
+        // directly via the raw path after a one-shot enable that we will
+        // redo properly after bss zero + serial init. For this fatal path
+        // only, force SERIAL_OK through a local write that survives because
+        // we halt immediately after.
+        //
+        // Order note: we have NOT zeroed .bss yet, so a store to SERIAL_OK
+        // is fine for this one-shot message.
         console::raw::set_serial_ok(true);
         console::raw::print(format_args!(
             "\r\nORIN-FATAL-BEGIN\r\n\
@@ -105,6 +113,28 @@ pub fn kernel_main(multiboot_info_phys: u64, boot_params_phys: u64) -> ! {
             crate::cpu::halt();
         }
     }
+
+    // -- step 0a: zero kernel .bss ----------------------------------------
+    // MUST run before any kernel static is written and kept. The boot stub
+    // zeroed `.boot_bss` (page tables, stacks) but not the kernel `.bss` —
+    // higher half was not mapped yet. Every `static mut` / `static` with
+    // zero init lives here: PMM bitmap, spin::Mutex cells, log CONFIG,
+    // SERIAL_OK, and the boot-params pointer.
+    //
+    // Historical bug: zeroing .bss at "step 6" (after serial init and after
+    // set_boot_params) wiped SERIAL_OK (silent raw console), the boot-params
+    // pointer (next arch::boot_params() panicked), and every Mutex. The panic
+    // handler then tried to format a String, hit the still-empty heap, and
+    // reported a confusing "heap exhausted: 16 bytes" secondary panic.
+    //
+    // Order is therefore: zero bss → set_boot_params → serial/VGA → rest.
+    // Statics with non-zero initial values live in `.data` and are not
+    // touched. The higher-half alias is valid: boot page tables map phys
+    // 0..2 GiB at KERNEL_VMA.
+    zero_kernel_bss();
+
+    // Record the boot parameter block ONLY AFTER bss is clean, otherwise
+    // zero_kernel_bss would erase the store.
     arch::set_boot_params(boot_params_phys);
 
     // -- step 1: serial ---------------------------------------------------
@@ -130,6 +160,15 @@ pub fn kernel_main(multiboot_info_phys: u64, boot_params_phys: u64) -> ! {
     crate::kinfo!("==============================================================");
     crate::kinfo!("build id      : {}", trimmed_build_id());
     crate::kinfo!("serial COM1   : {}", if serial_ok { "present (loopback self-test passed)" } else { "NOT PRESENT — logs will not be captured" });
+    {
+        extern "C" {
+            static _kernel_bss_start: u8;
+            static _kernel_bss_end: u8;
+        }
+        let bs = crate::linker_sym!(_kernel_bss_start);
+        let be = crate::linker_sym!(_kernel_bss_end);
+        crate::kinfo!("bss: zeroed {} KiB at {:#x} (before any static was written)", (be - bs) / 1024, bs);
+    }
     if !serial_ok {
         // Say it plainly. A kernel whose serial port is absent produces no
         // capturable log, and `make test` would then fail for a reason that has
@@ -160,16 +199,7 @@ pub fn kernel_main(multiboot_info_phys: u64, boot_params_phys: u64) -> ! {
     // -- step 5: verify long mode ------------------------------------------
     verify_long_mode();
 
-    // -- step 6: zero kernel .bss -------------------------------------------
-    // The boot stub zeroed `.boot_bss` (page tables, stacks) but NOT the kernel
-    // `.bss`, because at that point the higher half was not mapped yet. Every
-    // `static` in the kernel — the PMM bitmap, every `spin::Mutex`, the log
-    // config — lives here, so this must run before any of them is touched.
-    //
-    // Reading/writing through the higher-half alias is valid: the boot page
-    // tables map physical 0..2 GiB to both halves.
-    zero_kernel_bss();
-
+    // -- step 6: (bss already zeroed at kmain entry; see step 0a) ------------
     // -- step 7: parse the boot information ---------------------------------
     let boot = match multiboot::read_from(multiboot_info_phys) {
         Ok(b) => b,
@@ -313,7 +343,9 @@ fn zero_kernel_bss() {
     unsafe {
         core::ptr::write_bytes(start as *mut u8, 0, len as usize);
     }
-    crate::kdebug!("bss: zeroed {} bytes at {:#x}..{:#x}", len, start, end);
+    // No kdebug here: serial/VGA/log CONFIG are not live yet. The byte count is
+    // re-reported from kmain after the consoles come up (see the step-0a log).
+    let _ = (start, end, len); // keep for a future post-console report
 }
 
 /// Confirm the CPU is in the state the boot stub claims to have left it in.
@@ -552,7 +584,14 @@ fn report_framebuffer(boot: &BootInfo) {
                 fb.address, fb.width, fb.height, fb.bpp, fb.pitch, fb.size / 1024, kind
             );
             if fb.fb_type == multiboot::info::fbtype::EGA_TEXT {
-                crate::kinfo!("fb: GRUB supplied a TEXT framebuffer; M8 needs a graphics mode (add `set gfxpayload=keep` to grub.cfg)");
+                crate::console::vga::set_text_mode_live(true);
+                crate::kinfo!("fb: GRUB supplied a TEXT framebuffer (VGA text console is live)");
+            } else {
+                // Linear FB means 0xB8000 is not the on-screen buffer.
+                crate::console::vga::set_text_mode_live(false);
+                crate::kwarn!(
+                    "fb: graphics mode active — VGA text console writes go to 0xB8000 which is not on screen.                      M1 logging is serial-primary; M8 owns the framebuffer."
+                );
             }
             if fb.address + fb.size > BOOT_MAPPED_BYTES {
                 crate::kwarn!(
@@ -795,6 +834,10 @@ fn yes(b: bool) -> &'static str {
 /// completion, so nobody mistakes it for one.
 fn idle(params: &BootParams) -> ! {
     crate::kinfo!("idle: entering the M1 input echo loop");
+    // Stable arm-time marker for tests/test_boot.sh. Per-key echoes use the
+    // same ORIN|K|ECHO| prefix with the character; this line proves the path is
+    // live before any key is injected.
+    crate::console::serial::print(format_args!("ORIN|K|ECHO|ARMED\r\n"));
     vga_print_prompt();
 
     // Interrupts on. Every handler is installed and the self-test has already

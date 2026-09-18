@@ -339,9 +339,10 @@ fn canary_ok(phys: u64) -> bool {
     if idx >= MAX_FRAMES || !crate::arch::phys_is_boot_mapped(PhysAddr::new(phys)) {
         return true;
     }
-    // SAFETY: `phys` is inside the boot-mapped range and the PMM owns it, so
-    // the higher-half alias is a valid, exclusive pointer to this frame.
-    let va = crate::arch::phys_to_virt(PhysAddr::new(phys));
+    // SAFETY: `phys` is inside the boot-mapped range and the PMM owns it.
+    // Use the identity map, not the higher-half alias: after vmm::init only
+    // PML4[0] still covers every low physical frame (see arch::phys_as_ident).
+    let va = crate::arch::phys_as_ident(PhysAddr::new(phys));
     let word = unsafe { (va.as_u64() as *const u64).read_volatile() };
     word != FREE_CANARY
 }
@@ -446,8 +447,9 @@ impl PmmInner {
         self.free_frames += 1;
         if cfg!(debug_assertions) {
             // SAFETY: frame is managed, inside the boot-mapped range, and we
-            // hold the PMM lock so nobody else can be using it.
-            let va = crate::arch::phys_to_virt(PhysAddr::new(phys));
+            // hold the PMM lock so nobody else can be using it. Identity map:
+            // see canary_ok / arch::phys_as_ident.
+            let va = crate::arch::phys_as_ident(PhysAddr::new(phys));
             unsafe { (va.as_u64() as *mut u64).write_volatile(FREE_CANARY) };
         }
     }

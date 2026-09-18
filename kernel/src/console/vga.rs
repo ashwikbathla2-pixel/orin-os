@@ -13,7 +13,6 @@ use core::fmt;
 use core::ptr;
 use spin::Mutex;
 
-use crate::arch::phys_to_virt;
 use x86_64::PhysAddr;
 
 pub const WIDTH: usize = 80;
@@ -67,9 +66,12 @@ struct Cell {
 /// region; writes there have side effects, so every access is `volatile`.
 #[inline]
 unsafe fn cell_ptr(index: usize) -> *mut Cell {
-    // The VGA window is below 1 MiB, i.e. inside the boot identity map, so the
-    // higher-half translation is valid for it.
-    let base = phys_to_virt(PhysAddr::new(VGA_PHYS)).as_u64() as *mut Cell;
+    // VGA lives at physical 0xB8000, inside the M1 identity map (PML4[0]).
+    // After vmm::init the higher-half alias is only partially rebuilt, so the
+    // HH device window at KERNEL_VMA+0xB8000 can be missing or stale depending
+    // on map order; the identity address is what the firmware and every BIOS
+    // VGA driver use and is guaranteed present until M4 drops the identity map.
+    let base = crate::arch::phys_as_ident(PhysAddr::new(VGA_PHYS)).as_u64() as *mut Cell;
     // SAFETY: the caller guarantees `index < WIDTH * HEIGHT`, so the offset
     // stays inside the single mapped VGA page.
     unsafe { base.add(index) }
@@ -221,6 +223,14 @@ impl VgaWriter {
         (self.row, self.column)
     }
 
+    /// Write one character at an absolute (row, col) without moving the cursor.
+    /// Used by the boot self-test so a cursor mid-line cannot invalidate the probe.
+    pub fn put_at(&mut self, row: usize, col: usize, ascii: u8) {
+        if row < HEIGHT && col < WIDTH {
+            write_cell(row * WIDTH + col, ascii, self.color);
+        }
+    }
+
     /// Read back a whole row of text. Used by the boot self-test to verify the
     /// console actually wrote what it claimed to write.
     pub fn read_row(&self, row: usize) -> [u8; WIDTH] {
@@ -249,6 +259,19 @@ impl fmt::Write for VgaWriter {
 }
 
 /// The global VGA console.
+/// Set by kmain after Multiboot FB discovery: false when GRUB left a linear
+/// framebuffer active and the 0xB8000 text window is not the live display.
+static TEXT_MODE_LIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+pub fn set_text_mode_live(v: bool) {
+    TEXT_MODE_LIVE.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn text_mode_live() -> bool {
+    TEXT_MODE_LIVE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub static WRITER: Mutex<VgaWriter> = Mutex::new(VgaWriter::new());
 
 /// Print to the VGA console only. Safe to call before `log` is configured.

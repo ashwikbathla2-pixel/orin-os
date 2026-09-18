@@ -84,7 +84,7 @@ trap 'cleanup_qemu; rm -rf "$WORKDIR"' EXIT
 deadline=$((SECONDS + TIMEOUT))
 saw_summary=0
 while (( SECONDS < deadline )); do
-    if [[ -f "$SERIAL_LOG" ]] && grep -q 'ORIN|SELFTEST|SUMMARY|' "$SERIAL_LOG" 2>/dev/null; then
+    if [[ -f "$SERIAL_LOG" ]] && grep -qE 'SELFTEST\|SUMMARY' "$SERIAL_LOG" 2>/dev/null; then
         saw_summary=1
         # Give the banner a moment to land after the SUMMARY.
         sleep 0.5
@@ -162,18 +162,19 @@ check "grep -qE 'ORIN\\|[TDIWECP]\\|' \"$NORM\"" \
 # 2. Self-test ran to completion. A missing SUMMARY is the most common silent
 #    failure mode: the kernel panics or hangs mid-suite and "no FAIL lines"
 #    would otherwise look green.
-check "grep -q 'ORIN|SELFTEST|SUMMARY|' \"$NORM\"" \
+# Wire format is ORIN|<level>|<ts>|SELFTEST|SUMMARY  |result|<n> passed, ...
+# (subsys field is "SELFTEST|SUMMARY"; level/timestamp sit between ORIN and it).
+check "grep -qE 'ORIN\\|[TDIWECP]\\|.*SELFTEST\\|SUMMARY' \"$NORM\"" \
       "selftest SUMMARY line present"
 
 # 3. No self-test failed. SKIP is allowed (and reported); FAIL is not.
-fail_lines=$(grep -c 'ORIN|SELFTEST|FAIL|' "$NORM" || true)
+fail_lines=$(grep -cE 'ORIN\|[TDIWECP]\|.*SELFTEST\|FAIL' "$NORM" || true)
 check "[[ $fail_lines -eq 0 ]]" \
       "no selftest FAIL lines (found $fail_lines)"
 
 # 4. At least one self-test passed. An empty suite that prints
 #    "SUMMARY|0 passed, 0 failed, 0 skipped" is not a boot.
-check "grep -qE 'ORIN\\|SELFTEST\\|SUMMARY\\|[1-9][0-9]* passed' \"$NORM\" \
-       || grep -qE 'ORIN\\|SELFTEST\\|SUMMARY\\|[1-9][0-9]* passed,' \"$NORM\"" \
+check "grep -qE 'SELFTEST\\|SUMMARY.*[1-9][0-9]* passed' \"$NORM\"" \
       "selftest reported at least one PASS"
 
 # 5. The boot banner. Reaching it means init steps 1–18 completed, interrupts
@@ -192,7 +193,9 @@ check "! grep -q 'ORIN-FATAL-BEGIN' \"$NORM\"" \
 # 7. The echo path is armed. M1's idle loop prints ORIN|K|ECHO| when a decoded
 #    key is ready; the marker itself is emitted once at arm-time so the test
 #    can see the path is live even before a key is injected.
-check "grep -q 'ORIN|K|ECHO|' \"$NORM\" || grep -qiE 'echo.*(ready|armed|idle)' \"$NORM\"" \
+# Arm-time marker is ORIN|K|ECHO|ARMED (emitted once when the idle loop starts).
+# Per-key echoes are ORIN|K|ECHO|<char>. Either proves the path is live.
+check "grep -q 'ORIN|K|ECHO|' \"$NORM\" || grep -qiE 'idle: entering the M1 input echo' \"$NORM\"" \
       "keyboard echo path armed (ORIN|K|ECHO| or idle marker)"
 
 echo
@@ -200,7 +203,7 @@ echo "──── summary ─────────────────�
 if [[ $fail -eq 0 ]]; then
     echo "test_boot: PASS — $pass checks"
     # Surface the SUMMARY line so the make output names what ran.
-    grep 'ORIN|SELFTEST|SUMMARY|' "$NORM" | sed 's/^/    /' || true
+    grep -E 'SELFTEST\|SUMMARY' "$NORM" | sed 's/^/    /' || true
     exit 0
 else
     echo "test_boot: FAIL — $fail of $((pass + fail)) checks failed"

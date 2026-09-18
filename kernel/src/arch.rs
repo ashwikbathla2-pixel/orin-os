@@ -262,6 +262,28 @@ pub fn virt_to_phys(va: VirtAddr) -> Option<PhysAddr> {
 ///
 /// Only valid while the identity/higher-half alias covers `pa`, i.e. for
 /// `pa < BOOT_MAPPED_BYTES` in M1. Callers must check [`phys_is_boot_mapped`].
+/// Identity-map virtual address for a low physical frame.
+///
+/// After `vmm::init` switches CR3 to Orin's own page tables, only PML4[0]
+/// still carries the full 0..2 GiB identity map. The higher-half alias
+/// (`phys + KERNEL_VMA`) is *not* fully rebuilt — only the kernel image,
+/// heap, and a few device windows live there. Anything that must touch an
+/// arbitrary boot-mapped physical frame after the CR3 switch (PMM canaries,
+/// page-table walks, early DMA buffers) must use this identity form, not
+/// [`phys_to_virt`].
+///
+/// M4 removes the identity map entirely; callers of this helper are exactly
+/// the sites that must be rewritten then.
+#[inline(always)]
+pub fn phys_as_ident(pa: PhysAddr) -> VirtAddr {
+    debug_assert!(
+        pa.as_u64() < BOOT_MAPPED_BYTES,
+        "phys_as_ident({:#x}) outside the M1 identity map",
+        pa.as_u64()
+    );
+    VirtAddr::new(pa.as_u64())
+}
+
 pub fn phys_to_virt(pa: PhysAddr) -> VirtAddr {
     VirtAddr::new(pa.as_u64().wrapping_add(KERNEL_VMA))
 }

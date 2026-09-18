@@ -177,7 +177,9 @@ impl PtPool {
         // SAFETY: the frame was just allocated from the PMM, is inside the
         // boot-mapped range, and we hold the pool lock so nobody else has it.
         unsafe {
-            let p = boot_alias(pa).as_mut_ptr::<u8>();
+            // Identity map, same rationale as `table_at`: PT frames are low
+            // physical and must remain reachable after the CR3 switch.
+            let p = VirtAddr::new(pa.as_u64()).as_mut_ptr::<u8>();
             core::ptr::write_bytes(p, 0, PAGE_SIZE as usize);
         }
         Some(pa)
@@ -208,7 +210,23 @@ pub fn kernel_pml4() -> PhysAddr {
 /// that the caller has exclusive access to (a freshly allocated PT frame, or
 /// the boot tables before hardening).
 unsafe fn table_at(pa: PhysAddr) -> *mut u64 {
-    boot_alias(pa).as_mut_ptr::<u64>()
+    // Page-table frames live in low physical memory and are reached through
+    // the *identity* map (PML4[0]), not the higher-half boot alias.
+    //
+    // After `init` switches CR3 to Orin's own PML4, only PML4[0] still carries
+    // the full 0..2 GiB identity mapping inherited from the boot stub.
+    // PML4[511] holds the fine-grained kernel image / heap / device windows —
+    // it does *not* remap every low physical page at KERNEL_VMA+pa. Using
+    // `boot_alias(pa)` (= pa + KERNEL_VMA) here would therefore #PF the first
+    // time anything walked a page table after the CR3 switch (harden_boot_map,
+    // later map calls, self-test). The identity map is kept for exactly this
+    // reason until M4 removes it.
+    debug_assert!(
+        pa.as_u64() < BOOT_MAPPED_BYTES && pa.as_u64() % PAGE_SIZE == 0,
+        "table_at({:#x}): not a boot-mapped, page-aligned PT frame",
+        pa.as_u64()
+    );
+    VirtAddr::new(pa.as_u64()).as_mut_ptr::<u64>()
 }
 
 /// Physical address `pa` as a kernel virtual pointer, through the boot alias.
@@ -297,14 +315,19 @@ unsafe fn descend(table: *mut u64, index: usize) -> Option<PhysAddr> {
         return Some(PhysAddr::new(entry_addr(entry)));
     }
     let new_pa = PT_POOL.lock().alloc()?;
-    // Intermediate tables are always writable (the CPU writes A/D bits into
-    // them) and never executable. USER is deliberately not set: an
-    // intermediate table reachable from user space would let a user process
-    // influence kernel translations.
-    let mut f = flags::PRESENT | flags::WRITABLE;
-    if nx_available() {
-        f |= flags::NO_EXECUTE;
-    }
+    // Intermediate (non-leaf) entries: PRESENT | WRITABLE, NEVER NX.
+    //
+    // On x86_64 the XD/NX bit is hierarchical: if it is set on a PML4/PDPT/PD
+    // entry, *every* page under that entry is non-executable, regardless of
+    // the leaf PTE. Setting NX here made the whole higher-half non-executable
+    // the moment CR3 switched to Orin's tables — symptom was #PF(0x11) at the
+    // next instruction in .text (present + instruction-fetch), CR2 == RIP.
+    // NX belongs only on leaf entries (see `effective` / `map_4k` / `map_2m`).
+    //
+    // USER is deliberately not set: an intermediate table reachable from user
+    // space would let a user process influence kernel translations.
+    // WRITABLE is required so the CPU can set Accessed/Dirty on lower entries.
+    let f = flags::PRESENT | flags::WRITABLE;
     // SAFETY: as above; the entry is being initialised for the first time, so
     // no other translation can be observing it.
     unsafe { *table.add(index) = new_pa.as_u64() | f };

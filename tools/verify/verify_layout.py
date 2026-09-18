@@ -168,10 +168,10 @@ def main(elf):
               f"boot bss is 2 MiB aligned ({bp['boot_bss_phys_start']:#x})",
               "boot.asm maps with 2 MiB large pages, so a region straddling a\n"
               "2 MiB boundary would need a second PD entry the stub does not fill.")
-        expected_bss = 4 * PAGE + 16384 + 32768
+        expected_bss = 4 * PAGE + 65536 + 65536  # tables + boot stack + kernel stack
         got_bss = bp["boot_bss_phys_end"] - bp["boot_bss_phys_start"]
         check(got_bss == expected_bss,
-              f"boot bss is {got_bss:#x} = 4 page tables + 16K boot stack + 32K kernel stack",
+              f"boot bss is {got_bss:#x} = 4 page tables + 64K boot stack + 64K kernel stack",
               "boot.asm zeroes this range using sizes computed at ASSEMBLY time,\n"
               "because `mov ecx, (_end - _start)` with extern linker symbols is an\n"
               "invalid operand type in 32-bit mode. If the linker lays it out\n"
@@ -194,36 +194,53 @@ def main(elf):
               "kernel virtual addresses until the VMM builds real tables.")
 
     print()
-    print("  --- virtual layout: 2 MiB-aligned and disjoint (W^X depends on it) ---")
-    expect = {
-        ".text": KERNEL_VMA + 0 * LARGE_PAGE,
-        ".rodata": KERNEL_VMA + 1 * LARGE_PAGE,
-        ".data": KERNEL_VMA + 2 * LARGE_PAGE,
-        ".bss": KERNEL_VMA + 3 * LARGE_PAGE,
-    }
-    for name, want in expect.items():
-        got = secs.get(name, {}).get("vma")
-        check(got == want,
-              f"{name} VMA is {got:#x}" + ("" if got == want else f", expected {want:#x}"),
-              "Two sections sharing a 2 MiB region cannot have different\n"
-              "permissions. The VMM would have to pick one: R-X makes read-only\n"
-              "data writable, R-- makes the tail of .text non-executable and the\n"
-              "kernel faults on its own code.")
-    # Each section must end before the next region starts.
+    print("  --- virtual layout: VMA = LMA + KERNEL_VMA, 2 MiB-aligned, disjoint ---")
+    # Boot page tables alias phys P at both P and P+KERNEL_VMA. Every kernel
+    # section MUST satisfy VMA == LMA + KERNEL_VMA or the CPU fetches the wrong
+    # physical page after the long-mode jump (classic symptom: #UD at entry).
     order = [".text", ".rodata", ".data", ".bss"]
-    for i, name in enumerate(order):
+    prev_end = None
+    for name in order:
         s = secs.get(name)
         if not s:
+            check(False, f"{name} section missing")
             continue
-        end = s["vma"] + s["size"]
-        limit = KERNEL_VMA + (i + 1) * LARGE_PAGE if name != ".bss" else None
-        if limit is not None:
-            check(end <= limit,
-                  f"{name} ends at {end:#x}, within its 2 MiB region (< {limit:#x})",
-                  f"If {name} outgrows its region, widen the region in orin.ld\n"
-                  "(and the matching VMA of every later section). Do not relax\n"
-                  "the assert: the overlap is a silent W^X hole.")
+        vma, size = s["vma"], s["size"]
+        # LMA from program headers is more reliable than section file off for
+        # NOBITS; use the section's own sh_addr - KERNEL_VMA for the expected LMA
+        # under the boot-alias invariant.
+        expected_lma = vma - KERNEL_VMA if vma >= KERNEL_VMA else None
+        check(vma >= KERNEL_VMA,
+              f"{name} VMA {vma:#x} is in the higher half")
+        check(vma % LARGE_PAGE == 0,
+              f"{name} VMA {vma:#x} is 2 MiB aligned",
+              "Two sections sharing a 2 MiB region cannot have different "
+              "permissions (orin.ld PROBLEM 2).")
+        check(size <= LARGE_PAGE or name == ".bss",
+              f"{name} size {size:#x} fits a 2 MiB region (or is .bss which may grow)",
+              f"If {name} outgrows 2 MiB, give it more regions in orin.ld.")
+        if prev_end is not None:
+            check(vma >= prev_end,
+                  f"{name} VMA {vma:#x} is after previous section end {prev_end:#x}")
+        # Record end of this section's reserved 2 MiB slot (bss: just content end)
+        prev_end = vma + (LARGE_PAGE if name != ".bss" else max(size, 1))
 
+    # Boot-alias invariant against PT_LOAD
+    out = sh("readelf", "-l", "-W", elf)
+    for line in out.splitlines():
+        if not line.strip().startswith("LOAD"):
+            continue
+        p = line.split()
+        if len(p) < 6:
+            continue
+        va, pa = int(p[2], 16), int(p[3], 16)
+        if va >= KERNEL_VMA and int(p[4], 16) > 0:  # file-backed higher-half
+            check(va == pa + KERNEL_VMA,
+                  f"boot-alias: PT_LOAD va={va:#x} == pa={pa:#x} + KERNEL_VMA",
+                  "VMA must equal LMA + KERNEL_VMA or the boot page tables "
+                  "translate the kernel entry to the wrong physical page.")
+
+    
     print()
     print("  --- load addresses are packed and non-overlapping ---")
     loadable = [(n, s) for n, s in secs.items()

@@ -49,22 +49,11 @@ header_start:
     dd  0x100000000 - (0xE85250D6 + 0 + (header_end - header_start))
 
     ; ---- header tag type 5: framebuffer request ---------------------------
-    ;  (Header tag numbering per Multiboot2 spec section 3.1. Header tags and
-    ;   information-structure tags use DIFFERENT number spaces; this is tag 5
-    ;   in the header, and GRUB reports the result as info tag 9. Confusing the
-    ;   two is a classic silent-boot-failure, hence the explicit note.)
-    ;
-    ;  width/height/depth = 0 with flags = 0 means "GRUB, choose a mode the
-    ;  firmware supports and tell me what you chose". Orin reads the result at
-    ;  runtime rather than hard-coding a mode it cannot know the display
-    ;  supports. Requesting a fixed mode here would boot fine in QEMU and fail
-    ;  on real hardware.
-    align 8
-    dw  5                                               ; type: framebuffer
-    dw  0                                               ; flags: optional
-    dd  24                                              ; size
-    dd  0, 0, 0                                         ; width, height, depth
-    dd  0                                               ; framebuffer type flags
+    ;  OMITTED in M1. Requesting a framebuffer makes GRUB switch into a linear
+    ;  graphics mode (1280x800 on QEMU), which removes the VGA text buffer at
+    ;  0xB8000 that the M1 console and its self-test depend on. M1 deliberately
+    ;  boots in EGA text mode; M8 re-introduces this tag when the framebuffer
+    ;  console lands. See docs/BOOT.md.
 
     ; ---- header tag type 3: entry address (NON-optional) ------------------
     ;  Without this tag GRUB jumps to the ELF e_entry, which is the
@@ -82,14 +71,14 @@ header_start:
     ;  corrupts memory on firmware that disagrees. We request exactly what we
     ;  parse, and nothing we would ignore:
     ;      1 = boot command line    2 = boot loader name
-    ;      5 = framebuffer info     6 = memory map
+    ;      6 = memory map
+    ;  Framebuffer (5) is intentionally not requested in M1 — see tag 5 note.
     align 8
     dw  1                                               ; type: info_request
     dw  0                                               ; flags: optional
-    dd  8 + (4 * 4)                                     ; size
+    dd  8 + (4 * 3)                                     ; size
     dd  1                                               ;   command line
     dd  2                                               ;   loader name
-    dd  5                                               ;   framebuffer
     dd  6                                               ;   memory map
 
     ; ---- tag 0: END -------------------------------------------------------
@@ -308,12 +297,13 @@ _long_mode_start:
     mov  gs, ax
     mov  ss, ax
 
-    ;  Boot stack: the top of the 16 KiB stack boot.asm reserves in .boot_bss.
-    ;  It is NOT in the 0x90000..0x9FFFF range the Multiboot2 spec suggests for
-    ;  a loader-provided stack, because this stub allocates its own inside the
-    ;  kernel image; orin.ld places .boot_bss at a 2 MiB-aligned physical
-    ;  address and asserts its size matches what this file reserves.
-    mov  rsp, _boot_stack_top
+    ;  Switch to the kernel stack immediately. The boot stack still exists for
+    ;  the 32-bit path and as a spare, but Rust init (especially debug builds of
+    ;  multiboot::parse) needs more than 16 KiB and previously smashed the page
+    ;  tables sitting just below the old 16 KiB boot stack. Both stacks live in
+    ;  .boot_bss at low physical addresses, reachable through the identity map
+    ;  and the higher-half alias.
+    mov  rsp, _kernel_stack_top
     and  rsp, ~0xF                                      ; SysV: 16-byte align
 
     ;  Hand off. Two arguments, both PHYSICAL addresses:
@@ -430,8 +420,16 @@ section .boot_data progbits alloc write align=16
 _boot_info_phys: dd 0
 
 ; =============================================================================
-;  .bss: page tables (24 KiB) + boot stack (16 KiB) + kernel stack (32 KiB).
+;  .bss: page tables (16 KiB) + boot stack (64 KiB) + kernel stack (64 KiB).
 ;  Zeroed by step 6 above. Marked NOBITS by the linker script.
+;
+;  Boot stack was 16 KiB and that was not enough: multiboot::parse alone uses
+;  ~8 KiB of stack frames in a debug build, and with the call chain from
+;  kmain the stack grew down from 0x208000 into the page tables at 0x200000
+;  (CR2 landed in .bss while RSP was 0x201bb0). Symptom: #PF then triple
+;  fault, after serial had already printed the long-mode banner. 64 KiB is
+;  enough headroom for M1 debug init without waiting on the kernel stack
+;  switch; the kernel stack is switched to immediately in _long_mode_start.
 ; =============================================================================
 section .boot_bss nobits alloc write align=4096
 align 4096
@@ -445,15 +443,17 @@ _boot_pd0:   resb 4096
 align 4096
 _boot_pd1:   resb 4096
 align 4096
-_boot_stack_bottom: resb 16384
+; Guard page worth of gap is NOT unmapped in M1 (boot large pages cover it).
+; The size itself is the guard: 64 KiB before we reach the page tables.
+_boot_stack_bottom: resb 65536
 global _boot_stack_top
 _boot_stack_top:
 align 16
-;  The kernel switches to this stack once the heap and VMM exist. It is
-;  allocated in .bss rather than on the heap so that a heap failure during
-;  early init still has somewhere to run.
+; Kernel stack: switched to in _long_mode_start before calling Rust. Lives
+; in .boot_bss (not the heap) so a heap failure during early init still has
+; a stack. 64 KiB matches the boot stack.
 global _kernel_stack_bottom
-_kernel_stack_bottom: resb 32768
+_kernel_stack_bottom: resb 65536
 global _kernel_stack_top
 _kernel_stack_top:
 align 4096

@@ -43,8 +43,9 @@ pub mod tag {
     pub const BOOTDEV: u16 = 5;
     pub const MMAP: u16 = 6;
     pub const VBE: u16 = 7;
-    pub const ELF_SECTIONS: u16 = 8;
-    pub const APM: u16 = 9;
+    pub const FRAMEBUFFER_SPEC: u16 = 8; // Multiboot2 info tag: framebuffer
+    pub const ELF_SECTIONS: u16 = 9;
+    pub const APM: u16 = 10;
     pub const EFI32_IH: u16 = 10;
     pub const EFI64_IH: u16 = 11;
     pub const SMBIOS: u16 = 12;
@@ -56,14 +57,11 @@ pub mod tag {
     pub const EFI32_CT: u16 = 18;
     pub const EFI64_CT: u16 = 19;
     pub const LOAD_BASE_ADDR: u16 = 20;
-    /// GRUB emits the framebuffer as tag 9 in the *header request* but the
-    /// information-structure tag for a framebuffer is 9 in GRUB's
-    /// implementation of `MULTIBOOT_TAG_TYPE_FRAMEBUFFER`. The spec numbers it
-    /// 9 as well; `APM` above (9) is the value GRUB never emits for x86_64
-    /// EFI boots. To remove all ambiguity we accept BOTH 9 and the spec's
-    /// framebuffer id, and log which one we saw.
-    pub const FRAMEBUFFER: u16 = 9;
-    pub const FRAMEBUFFER_ALT: u16 = 8;
+    /// Multiboot2 *information structure* tag type for a framebuffer is **8**
+    /// (spec §3.6). Header *request* tag 5 is a different number space.
+    /// Historically this file swapped 8/9 with ELF_SECTIONS, which made GRUB's
+    /// ELF sections tag parse as a framebuffer (address 0x4000000013 etc.).
+    pub const FRAMEBUFFER: u16 = 8;
 
     /// All tags are padded to 8-byte multiples.
     pub const ALIGN: usize = 8;
@@ -360,8 +358,7 @@ pub fn parse(bytes: &[u8]) -> Result<BootInfo, ParseError> {
                 saw_mmap = true;
                 parse_mmap(body, &mut info)?;
             }
-            // Accepted from either id: see the note on tag::FRAMEBUFFER.
-            tag::FRAMEBUFFER | tag::FRAMEBUFFER_ALT if body.len() >= 24 => {
+            tag::FRAMEBUFFER if body.len() >= 24 => {
                 if info.framebuffer.is_none() {
                     info.framebuffer = parse_framebuffer(body);
                 }

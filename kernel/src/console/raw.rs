@@ -103,7 +103,7 @@ fn vga_cell(row: usize, col: usize, ascii: u8, attr: u8) {
     // The VGA window is mapped as a device region by `vmm::init` at
     // `phys_to_virt(0xB8000)`. Recomputing the address here rather than sharing
     // `vga::WRITER`'s state keeps this path free of any dependency on a lock.
-    let base = crate::arch::phys_to_virt(x86_64::PhysAddr::new(0xB8000)).as_u64();
+    let base = crate::arch::phys_as_ident(x86_64::PhysAddr::new(0xB8000)).as_u64();
     let off = (row * WIDTH + col) * 2;
     // SAFETY: `base + off` is inside the single mapped VGA page (row < 25,
     // col < 80 keeps off < 4000). Volatile because it is a device region.
@@ -115,7 +115,7 @@ fn vga_cell(row: usize, col: usize, ascii: u8, attr: u8) {
 }
 
 fn vga_scroll() {
-    let base = crate::arch::phys_to_virt(x86_64::PhysAddr::new(0xB8000)).as_u64();
+    let base = crate::arch::phys_as_ident(x86_64::PhysAddr::new(0xB8000)).as_u64();
     // SAFETY: copies within the mapped VGA page. `copy_from` on overlapping
     // ranges is correct here because we move rows upward in ascending order,
     // and each source row is read before its destination row is written.

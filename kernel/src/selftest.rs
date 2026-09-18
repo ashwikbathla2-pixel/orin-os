@@ -165,7 +165,15 @@ pub fn run_all() -> (usize, usize, usize) {
     run("errno_negated_range", &mut t, test_errno_range);
 
     // ---- console --------------------------------------------------------
-    run("console_vga_writeback", &mut t, test_console_vga);
+    if crate::console::vga::text_mode_live() {
+        run("console_vga_writeback", &mut t, test_console_vga);
+    } else {
+        skip(
+            "console_vga_writeback",
+            &mut t,
+            "display is in graphics mode; VGA text buffer at 0xB8000 is not the live console",
+        );
+    }
 
     // ---- hardware-dependent, skippable ---------------------------------
     match crate::drivers::keyboard::presence() {
@@ -542,8 +550,11 @@ fn test_control_registers() -> Result<String, String> {
     if !problems.is_empty() {
         return Err(format!("{} control-register problem(s): {}", problems.len(), problems.join(" | ")));
     }
+    let f = crate::cpu::cpuid::detect();
     Ok(format!(
-        "CR0.WP, CR0.PG, EFER.LMA, EFER.NXE, CR4.SMEP, CR4.SMAP all as documented (cr0={:#x} cr4={:#x} efer={:#x})",
+        "CR0.WP/PG, EFER.LMA/NXE set; SMEP={} SMAP={} (cr0={:#x} cr4={:#x} efer={:#x})",
+        if f.smep { "on" } else { "n/a (CPUID)" },
+        if f.smap { "on" } else { "n/a (CPUID)" },
         regs.cr0, regs.cr4, regs.efer
     ))
 }
@@ -880,26 +891,50 @@ fn test_errno_range() -> Result<String, String> {
 // ===========================================================================
 
 fn test_console_vga() -> Result<String, String> {
-    use core::fmt::Write;
-    // Write a known string and read it back out of the VGA buffer. This proves
-    // the console wrote to the address it thinks it wrote to — which is not
-    // trivially true in a higher-half kernel where the device window is reached
-    // through a translation we built ourselves.
-    let marker = "ORIN-M1";
-    let row = {
-        let w = crate::console::vga::WRITER.lock();
-        w.position().0
-    };
+    // Prove the VGA window is reachable through the address the console uses.
+    // Pin to a fixed cell rather than the live cursor: boot logging may leave
+    // the cursor mid-line or on the last row, so a write!() can wrap/scroll and
+    // the subsequent read_row of the *old* row would miss the marker. Direct
+    // cell I/O is what the console itself uses under the hood.
+    let marker = b"ORIN-M1";
+    let row = 12usize;
+    let col0 = 0usize;
     {
         let mut w = crate::console::vga::WRITER.lock();
-        let _ = write!(w, "{}", marker);
+        w.clear_line(row);
+        for (i, &b) in marker.iter().enumerate() {
+            w.put_at(row, col0 + i, b);
+        }
     }
     let back = crate::console::vga::WRITER.lock().read_row(row);
-    let got: String = back.iter().take(marker.len()).map(|&b| b as char).collect();
+    let got = &back[col0..col0 + marker.len()];
     if got != marker {
-        return Err(format!("wrote {marker:?} to VGA row {row}, read back {got:?}"));
+        return Err(format!(
+            "wrote {:?} to VGA ({row},{col0}), read back {:?}",
+            core::str::from_utf8(marker).unwrap_or("?"),
+            core::str::from_utf8(got).unwrap_or("?")
+        ));
     }
-    Ok(format!("wrote and read back {marker:?} from VGA row {row} through the device mapping"))
+    // Also verify the identity-map path the driver uses matches a raw probe.
+    let raw = unsafe {
+        let p = crate::arch::phys_as_ident(x86_64::PhysAddr::new(0xB8000)).as_u64() as *const u8;
+        // Cell layout: ascii at even offsets.
+        let mut buf = [0u8; 7];
+        for i in 0..7 {
+            buf[i] = core::ptr::read_volatile(p.add((row * 80 + col0 + i) * 2));
+        }
+        buf
+    };
+    if &raw != marker {
+        return Err(format!(
+            "VGA driver OK but raw identity probe at 0xb8000 read {:?}, expected {:?}",
+            raw, marker
+        ));
+    }
+    Ok(format!(
+        "wrote and read back {:?} from VGA row {row} via driver + identity map",
+        core::str::from_utf8(marker).unwrap_or("?")
+    ))
 }
 
 // ===========================================================================

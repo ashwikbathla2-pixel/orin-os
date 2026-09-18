@@ -41,11 +41,16 @@ use crate::arch::PAGE_SIZE;
 // without updating docs/SYSCALL.md: `sysret`'s user-selector derivation
 // requires user data to immediately precede user code.
 
-pub const KERNEL_CODE_SEL: u16 = 0x08;
-pub const KERNEL_DATA_SEL: u16 = 0x10;
-pub const USER_DATA_SEL: u16 = 0x18;
-pub const USER_CODE_SEL: u16 = 0x20;
-pub const TSS_SEL: u16 = 0x28;
+// Full selector values as returned by `GlobalDescriptorTable::append` (index
+// shifted left 3, OR'd with the descriptor's DPL as RPL). User segments are
+// DPL 3, so their selectors are 0x1B / 0x23 — not 0x18 / 0x20. `sysret` forces
+// RPL to 3 from STAR arithmetic on the index base; the constants here are the
+// values software loads into segment registers and compares against.
+pub const KERNEL_CODE_SEL: u16 = 0x08; // index 1, RPL 0
+pub const KERNEL_DATA_SEL: u16 = 0x10; // index 2, RPL 0
+pub const USER_DATA_SEL: u16 = 0x1B;   // index 3, RPL 3
+pub const USER_CODE_SEL: u16 = 0x23;   // index 4, RPL 3
+pub const TSS_SEL: u16 = 0x28;         // index 5, RPL 0 (16-byte system segment)
 
 /// IST slot assignments. Slot indices are 1-based, matching the TSS field order.
 pub mod ist {
@@ -194,9 +199,16 @@ pub fn init() -> Selectors {
         // -- load --------------------------------------------------------
         // SAFETY: GDT_STORAGE is a 'static kernel image address, mapped and
         // valid for the lifetime of the kernel.
+        //
+        // `GlobalDescriptorTable::append` already returns a fully-formed
+        // `SegmentSelector` (index << 3 | RPL). Storing `.0` into `sels` keeps
+        // that encoding. Re-wrapping with `SegmentSelector::new(sels.tss, …)`
+        // would shift again (0x28 → 0x140) and #GP on `ltr` — that was the
+        // triple-fault after "gdt: IST5 stack …". Pass the raw selector bits
+        // straight through `SegmentSelector(sels.*)`.
         unsafe {
             (*core::ptr::addr_of!(GDT_STORAGE)).load();
-            x86_64::instructions::tables::load_tss(SegmentSelector::new(sels.tss, x86_64::PrivilegeLevel::Ring0));
+            x86_64::instructions::tables::load_tss(SegmentSelector(sels.tss));
         }
 
         // -- reload segment registers ------------------------------------
@@ -215,13 +227,12 @@ pub fn init() -> Selectors {
             // because AMD does not support 64-bit far jumps — so this is the
             // only portable way to reload CS at all.
             use x86_64::instructions::segmentation::{Segment, CS, DS, ES, FS, GS, SS};
-            let ring0 = x86_64::PrivilegeLevel::Ring0;
-            CS::set_reg(SegmentSelector::new(sels.kernel_code, ring0));
-            SS::set_reg(SegmentSelector::new(sels.kernel_data, ring0));
-            DS::set_reg(SegmentSelector::new(sels.kernel_data, ring0));
-            ES::set_reg(SegmentSelector::new(sels.kernel_data, ring0));
-            FS::set_reg(SegmentSelector::new(sels.kernel_data, ring0));
-            GS::set_reg(SegmentSelector::new(sels.kernel_data, ring0));
+            CS::set_reg(SegmentSelector(sels.kernel_code));
+            SS::set_reg(SegmentSelector(sels.kernel_data));
+            DS::set_reg(SegmentSelector(sels.kernel_data));
+            ES::set_reg(SegmentSelector(sels.kernel_data));
+            FS::set_reg(SegmentSelector(sels.kernel_data));
+            GS::set_reg(SegmentSelector(sels.kernel_data));
         }
 
         // Verify the selectors came out as the ABI requires. If they did not,
@@ -234,6 +245,8 @@ pub fn init() -> Selectors {
         );
         assert_eq!(sels.user_data, USER_DATA_SEL, "gdt: user data selector mismatch");
         assert_eq!(sels.user_code, USER_CODE_SEL, "gdt: user code selector mismatch");
+        assert_eq!(sels.tss, TSS_SEL, "gdt: TSS selector mismatch");
+        assert_eq!(sels.kernel_data, KERNEL_DATA_SEL, "gdt: kernel data selector mismatch");
         crate::kinfo!(
             "gdt: installed (kcode {:#x}, kdata {:#x}, udata {:#x}, ucode {:#x}, tss {:#x})",
             sels.kernel_code,
@@ -249,6 +262,9 @@ pub fn init() -> Selectors {
         );
     });
 
+    // Constants match what append produced (asserted above). Returning them
+    // rather than a fresh struct from `sels` keeps a single source of truth for
+    // the ABI numbers that M5's STAR programming will hard-code.
     Selectors {
         kernel_code: KERNEL_CODE_SEL,
         kernel_data: KERNEL_DATA_SEL,

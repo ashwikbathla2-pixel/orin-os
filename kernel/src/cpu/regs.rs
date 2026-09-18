@@ -231,13 +231,20 @@ impl CpuRegs {
             self.efer & (1 << 10) == 0,
             "EFER.LMA is CLEAR: the CPU is not in long mode"
         );
+        // SMEP/SMAP are soft requirements: they only exist on hardware that
+        // advertises them. QEMU's default TCG cpu ("qemu64"/2.5+) does not, and
+        // kmain already refused to set the bits after CPUID said no. Treating a
+        // missing feature as a *boot failure* would make every TCG selftest red
+        // for a documented, intentional degradation (docs/SECURITY.md §5).
+        // Require the bit only when the CPU claimed the feature.
+        let feats = crate::cpu::cpuid::detect();
         add!(
-            self.cr4 & (1 << 20) == 0,
-            "CR4.SMEP is CLEAR: the kernel can execute user-space code, removing a major ret2usr mitigation"
+            feats.smep && self.cr4 & (1 << 20) == 0,
+            "CR4.SMEP is CLEAR despite CPUID.SMEP: the kernel can execute user-space code, removing a major ret2usr mitigation"
         );
         add!(
-            self.cr4 & (1 << 21) == 0,
-            "CR4.SMAP is CLEAR: the kernel can read user memory without an explicit copy_*_user, so a stray pointer is not caught"
+            feats.smap && self.cr4 & (1 << 21) == 0,
+            "CR4.SMAP is CLEAR despite CPUID.SMAP: the kernel can read user memory without an explicit copy_*_user, so a stray pointer is not caught"
         );
         out
     }
