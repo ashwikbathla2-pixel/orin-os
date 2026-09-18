@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "tools/hostcheck",
+]
+# `cargo build` must NOT try to build the whole workspace: .cargo/config.toml
+# sets the default target to x86_64-unknown-none, which tools/hostcheck (a std
+# crate that runs on the host) cannot be built for. Restricting default-members
+# to the kernel keeps bare `cargo build` correct, while
+# `cargo test -p orin-hostcheck --target x86_64-unknown-linux-gnu` still reaches
+# the host tests explicitly — which is how `make test-host` invokes it.
+default-members = ["kernel"]
+
+# Deterministic builds (Engineering Rule 10).
+# Note: paths are NOT remapped because the kernel records source file/line in
+# panic messages, and remapping would make QEMU serial logs unactionable.
+# Reproducibility is instead pinned via rust-toolchain.toml + Cargo.lock
+# (committed) + `--locked`.
+[profile.dev]
+panic = "abort"
+debug = 2
+overflow-checks = true
+
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+debug = 1
+overflow-checks = true

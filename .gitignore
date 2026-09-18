@@ -1,0 +1,52 @@
+# Build artefacts — never commit
+/target/
+**/*.o
+**/*.a
+**/*.rlib
+**/*.so
+**/*.dylib
+**/*.dll
+**/*.exe
+**/*.iso
+**/*.img
+**/*.bin
+**/*.elf
+!arch/**/*.asm
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Rust / cargo
+Cargo.lock.bak
+**/*.rs.bk
+.cargo-cache/
+
+# QEMU / test scratch
+*.qcow2
+*.log
+/tmp/
+.orin-boot-*/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+.credentials
+.git-credentials
+.netrc
+
+# OS noise
+Thumbs.db
+desktop.ini

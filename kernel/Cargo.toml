@@ -1,0 +1,45 @@
+[package]
+name = "orin-kernel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "orink — the Orin OS kernel (x86_64)"
+publish = false
+
+# Auto-discovery is off so the two targets below are the *only* targets. Left on,
+# cargo would also try to build src/main.rs as an autonomous bin crate — one
+# whose `crate::arch` resolves to nothing, because a bin target is its own crate
+# root and cannot see the lib's modules. That produces ~125 confusing
+# "unresolved import" errors that have nothing to do with the imports.
+autobins = false
+autobenches = false
+autoexamples = false
+autotests = false
+
+[lib]
+name = "orin_kernel"
+path = "src/lib.rs"
+# rlib: every subsystem is compiled and type-checked here, and this is what
+# `cargo test` would exercise from M4 onwards.
+crate-type = ["rlib"]
+
+[[bin]]
+name = "orin_kernel"
+path = "src/main.rs"
+# This is the linked ELF. build.rs emits `-T arch/x86_64/orin.ld` and
+# `--whole-archive boot.o`, and `cargo:rustc-link-arg` applies only when a bin is
+# actually linked — so the linker script has to ride on this target, not the lib.
+# The result is a freestanding ELF whose section layout orin.ld dictates.
+
+[dependencies]
+# Deliberately minimal — see ADR-007 in docs/ARCHITECTURE.md §14.
+# Three pure-Rust, no-build-script, widely-audited crates. Everything
+# Orin-specific (multiboot2 parsing, frame allocator, VGA, serial, PS/2,
+# PIC, PIT, console, logging, self-test) is hand-rolled in this crate.
+x86_64 = { version = "0.15", default-features = false, features = ["instructions", "nightly"] }
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "once", "lazy"] }
+# `use_spin` is what provides `LockedHeap`; without it the crate only offers
+# the unlocked `Heap`, and a bare `Heap` in a `#[global_allocator]` would race
+# the moment M4 adds a second core.
+linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }

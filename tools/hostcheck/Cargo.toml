@@ -1,0 +1,22 @@
+[package]
+name = "orin-hostcheck"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = """
+Host-side unit tests for Orin kernel logic that must not depend on the machine.
+
+The kernel crate is no_std and cannot `cargo test` itself. Rather than
+duplicating logic into a test crate — which would let the copy drift from the
+real thing and silently stop testing anything — this crate `#[path]`-includes
+the actual kernel source files and tests them on the host. If the kernel file
+changes, these tests change with it.
+
+Only files that are free of hardware dependencies can be included this way;
+the split is deliberate and is what keeps `parse()` a pure function.
+"""
+
+[dependencies]
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned for reproducible builds. `rust-src` is required for -Zbuild-std,
+# llvm-tools-preview for `cargo objcopy`/`nm` during ISO assembly.
+channel = "nightly-2026-09-18"
+components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
+targets = ["x86_64-unknown-none"]
+profile = "minimal"

@@ -1,0 +1,102 @@
+# =============================================================================
+#  Orin OS — cargo configuration for the kernel target
+#
+#  Comments live OUTSIDE the arrays: TOML does not permit trailing comments on
+#  array element lines, and cargo would pass them to rustc as arguments.
+# =============================================================================
+
+[build]
+target = "x86_64-unknown-none"
+
+# --- Flag rationale -------------------------------------------------------
+# force-frame-pointers=yes : the panic handler walks RBP chains to produce a
+#     backtrace. Without frame pointers there is no backtrace without unwinding
+#     through .eh_frame, which is exactly the data most likely to be corrupt in
+#     a memory-corruption panic.
+# relocation-model=static  : the kernel is higher-half but non-PIE. Its base is
+#     a link-time constant, which is what makes "is this pointer in the kernel
+#     half" a single comparison (arch::KERNEL_SPACE_START).
+# target-cpu=x86-64        : the baseline x86_64 ISA only. Targeting a newer
+#     level would produce a kernel that #UDs on older hardware, and
+#     idt.rs::on_invalid_opcode names that as a likely cause — better to never
+#     ship it. SSE2 is architecturally mandatory on x86_64 and is asserted at
+#     boot by cpuid::report(), so it is used without a flag.
+#
+# Deliberately ABSENT:
+#   -C panic=abort     : set per-profile in the workspace Cargo.toml, where
+#                        cargo validates it (it is rejected for `test`).
+#   -T <linker script> : added by kernel/build.rs, which is the only place that
+#                        knows the script's absolute path.
+#
+# --- Flags that ARE present, and why they are load-bearing -----------------
+# -C code-model=kernel
+#     NOT OPTIONAL for a higher-half kernel, and the error you get without it
+#     does not mention it. The default "small" model assumes every address fits
+#     in 32 signed bits and emits R_X86_64_32S relocations. The kernel is linked
+#     at 0xFFFFFFFF80000000, so those relocations cannot be satisfied:
+#
+#         relocation R_X86_64_32S out of range: -4294967296 is not in
+#         [-2147483648, 2147483647]; references '_heap_virt_start'
+#
+#     The kernel model assumes the image lives in the top 2 GiB of the address
+#     space and emits RIP-relative accesses, which reach +/- 2 GiB and therefore
+#     cover the whole kernel image including the heap at 0xFFFFFFFF00000000.
+#
+#     It also creates a hard constraint that shapes the design: anything the
+#     kernel needs at a LOW PHYSICAL address cannot be a linker symbol
+#     reference, because low physical addresses are ~2 GiB away in the other
+#     direction. Such values must arrive as data read from mapped memory.
+#     orin.ld's `.boot_params` struct exists for exactly this, and its header
+#     comment explains the rule.
+# -C link-arg=-no-gc-sections
+#     rustc passes --gc-sections for this target. The kernel's ELF entry is
+#     `_boot_start` in boot.asm, and the only thing connecting it to the Rust
+#     code is a `call orin_kernel_main` that --whole-archive keeps but which is
+#     not a GC root the way ENTRY() is. With --gc-sections on, the linker
+#     discards the entire kernel: .text links at 32 bytes of int3 padding and
+#     orin_kernel_main is an empty symbol. The image links cleanly and does
+#     nothing. KEEP() in orin.ld is belt-and-braces; this flag is the actual
+#     fix, and `make verify-layout` fails if .text is ever suspiciously small.
+#
+#   -C target-feature=+sse,+sse2
+#     TRIED AND REVERTED, deliberately. x86_64-unknown-none ships
+#     `features = "-mmx,-sse,-sse2,...,+soft-float"`, and it is tempting to turn
+#     SSE2 back on because it is architecturally mandatory on x86_64 and
+#     cpuid::report() asserts it at boot.
+#
+#     It does not work: enabling it makes `compiler_builtins` fail to compile
+#     under `-Z build-std`, because that crate's per-target routine selection
+#     assumes the target's own feature set. Replacing one build failure with a
+#     worse one is not a fix.
+#
+#     What soft-float actually costs Orin, stated plainly rather than glossed:
+#     the SysV AMD64 ABI passes f64 in XMM0, and with SSE disabled LLVM passes
+#     it indirectly in memory instead. That is self-consistent across the whole
+#     kernel, since every crate is built with the same flags — so nothing is
+#     broken today. The real constraint is that Orin must not hand f64 across a
+#     boundary to something compiled for the standard x86_64 ABI. Two things
+#     enforce that instead of a comment:
+#       * the kernel performs no floating-point arithmetic at all (no FPU state
+#         is saved on context switch until M4), and all timing is u64
+#         microseconds, not f64 seconds;
+#       * `make verify-layout` greps the linked ELF for soft-float runtime
+#         symbols (__muldf3, __adddf3, __floatundidf, ...). If one appears,
+#         someone introduced FP arithmetic and the build fails with a message
+#         saying so. SSE2 enablement is then a real task with a real reason,
+#         not a flag flip.
+#     Recorded as ADR-011 in docs/ARCHITECTURE.md.
+# ===========================================================================
+
+[target.x86_64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
+    "-C", "target-cpu=x86-64",
+    "-C", "link-arg=-no-gc-sections",
+]
+
+# `tools/hostcheck` runs on the host and must not inherit the kernel target.
+# `cargo test -p orin-hostcheck --target x86_64-unknown-linux-gnu` overrides
+# [build].target; `make test-host` does exactly that.
